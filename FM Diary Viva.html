@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FM Diary Viva</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>tailwind.config={darkMode:'class'}</script>
+<script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/htm@3.1.1/dist/htm.umd.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+body{background:#f8fafc;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+html.dark body{background:#0f172a;color:#e2e8f0}
+.pre{white-space:pre-wrap}
+@media print{.noprint{display:none!important}body{background:#fff!important;color:#000!important}}
+</style>
+</head>
+<body class="text-slate-800">
+<div id="root"></div>
+<script>
+const {useState,useEffect,useMemo,useRef}=React;
+const html=htm.bind(React.createElement);
+
+/* ---------- constants ---------- */
+const DISC=['Cardiovascular','Endocrine','Respiratory','Gastrointestinal','Neurology','Maternal & Child Health','Psychiatry','Geriatrics','Infectious Disease','Dermatology','Musculoskeletal','Renal & Urology','ENT & Eye','Palliative & Other'];
+const DOM=['Clinical Reasoning & Differentials','Evidence-Based Management & Prescribing','Holistic & Primary Care Perspective','Ethics, Communication & Local System Issues'];
+const FIELDS=[['complaint','Presenting Complaint & Focused History'],['exam','Physical Examination & Key Investigations'],['dx','Working Diagnosis & Differentials'],['mgmt','My Initial Management & Follow-up Plan'],['learn','Key Learning Points / Clinical Dilemmas']];
+const STAT={confident:['Confident','bg-emerald-600 text-white'],review:['Needs Review','bg-amber-500 text-white'],weak:['Weak','bg-rose-600 text-white']};
+const DEFAULT_PROMPT=`You are a senior examiner and clinical educator for the Master of Family Medicine Final Viva in Malaysia. Reason as a primary care physician in a KKM health clinic with referral links to district/tertiary hospitals. Prioritise Malaysian CPGs (MOH/KKM, Academy of Medicine, Malaysian Society guidelines) and the KKM formulary; use international guidelines (NICE, WHO, ADA, ESC, GINA, etc.) only if no local guideline exists, and say so. Never invent citations: name the guideline and year you are confident about and flag uncertainty. Output ONLY valid JSON as instructed.`;
+const PROVIDERS={
+  gemini:{name:'Google Gemini (API key)',model:'gemini-2.5-flash',type:'gemini'},
+  gemini_oauth:{name:'Google Gemini via Google login (no API key)',model:'gemini-2.5-flash',type:'gemini',oauth:1},
+  openai:{name:'OpenAI (ChatGPT)',model:'gpt-4o-mini',type:'oai',url:'https://api.openai.com/v1',json:1},
+  anthropic:{name:'Anthropic Claude',model:'claude-sonnet-5-5',type:'anthropic'},
+  openrouter:{name:'OpenRouter (any model)',model:'google/gemini-2.5-flash',type:'oai',url:'https://openrouter.ai/api/v1',json:1},
+  groq:{name:'Groq (fast Llama)',model:'llama-3.3-70b-versatile',type:'oai',url:'https://api.groq.com/openai/v1',json:1},
+  deepseek:{name:'DeepSeek',model:'deepseek-chat',type:'oai',url:'https://api.deepseek.com/v1',json:1},
+  mistral:{name:'Mistral',model:'mistral-large-latest',type:'oai',url:'https://api.mistral.ai/v1',json:1},
+  xai:{name:'xAI Grok',model:'grok-4',type:'oai',url:'https://api.x.ai/v1'},
+  together:{name:'Together AI',model:'meta-llama/Llama-3.3-70B-Instruct-Turbo',type:'oai',url:'https://api.together.xyz/v1'},
+  perplexity:{name:'Perplexity (web-search grounded)',model:'sonar-pro',type:'oai',url:'https://api.perplexity.ai'},
+  ollama:{name:'Ollama (local, free)',model:'llama3.1',type:'oai',url:'http://localhost:11434/v1',local:1,json:1},
+  lmstudio:{name:'LM Studio (local, free)',model:'local-model',type:'oai',url:'http://localhost:1234/v1',local:1},
+  custom:{name:'Custom OpenAI-compatible URL',model:'',type:'oai',custom:1,json:1},
+  manual:{name:'Manual: copy prompt / paste reply (no API key)',model:'',type:'manual'}
+};
+
+/* ---------- storage ---------- */
+const KEY='fmdv.v1';
+const load=()=>{try{const d=JSON.parse(localStorage.getItem(KEY));if(d&&d.cases)return d}catch(e){}return{cases:[],settings:{provider:'gemini',key:'',model:'',prompt:DEFAULT_PROMPT,dark:false}}};
+const uid=()=>Math.random().toString(36).slice(2,10);
+
+/* ---------- Google login (OAuth token client) ---------- */
+const Google={
+  tok:null,exp:0,
+  token(s){return new Promise((res,rej)=>{
+    if(this.tok&&Date.now()<this.exp)return res(this.tok);
+    if(!s.cid)return rej(new Error('Enter your Google OAuth Client ID in Settings first.'));
+    if(!window.google?.accounts?.oauth2)return rej(new Error('Google sign-in script did not load (it is blocked on the hosted preview page). Run the app from your own http(s) origin, e.g. localhost or your own host.'));
+    const c=google.accounts.oauth2.initTokenClient({client_id:s.cid,scope:'https://www.googleapis.com/auth/generative-language.retriever https://www.googleapis.com/auth/cloud-platform',
+      callback:r=>{if(r.error)return rej(new Error(r.error_description||r.error));Google.tok=r.access_token;Google.exp=Date.now()+(r.expires_in-60)*1000;res(r.access_token)},
+      error_callback:e=>rej(new Error(e.message||e.type||'Sign-in cancelled'))});
+    c.requestAccessToken();
+  })},
+  out(){if(this.tok&&window.google?.accounts?.oauth2)google.accounts.oauth2.revoke(this.tok,()=>{});this.tok=null}
+};
+/* ---------- AI service layer (swap/extend providers here) ---------- */
+const AI={
+  async call(s,user){
+    const P=PROVIDERS[s.provider]||PROVIDERS.gemini;
+    if(P.type!=='manual'&&!P.local&&!P.oauth&&!s.key)throw new Error('Add your API key in Settings first.');
+    const tok=P.oauth?await Google.token(s):null;
+    const model=s.model||P.model;
+    let text;
+    if(P.type==='manual'){
+      copy(s.prompt+'\n\n'+user+'\n\nReturn ONLY valid JSON.');
+      text=window.prompt('Prompt copied to clipboard. Paste it into any AI chat (ChatGPT, Claude, Gemini, Copilot…), then paste the JSON reply here:')||'';
+      if(!text)throw new Error('Cancelled');
+    }else if(P.type==='anthropic'){
+      const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':s.key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify({model,max_tokens:8000,system:s.prompt,messages:[{role:'user',content:user}]})});
+      const j=await r.json();if(!r.ok)throw new Error(j.error?.message||'Claude error');
+      text=j.content?.map(p=>p.text||'').join('')||'';
+    }else if(P.type==='gemini'){
+      const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent${tok?'':'?key='+encodeURIComponent(s.key)}`,{method:'POST',headers:{'Content-Type':'application/json',...(tok?{Authorization:'Bearer '+tok}:{})},body:JSON.stringify({systemInstruction:{parts:[{text:s.prompt}]},contents:[{role:'user',parts:[{text:user}]}],generationConfig:{responseMimeType:'application/json'}})});
+      const j=await r.json();if(!r.ok)throw new Error(j.error?.message||'Gemini error');
+      text=j.candidates?.[0]?.content?.parts?.map(p=>p.text).join('')||'';
+    }else{
+      const base=(P.custom||P.local)?(s.base||P.url||''):P.url;
+      if(!base)throw new Error('Enter the base URL in Settings.');
+      const body={model,messages:[{role:'system',content:s.prompt},{role:'user',content:user}]};if(P.json)body.response_format={type:'json_object'};
+      const r=await fetch(base.replace(/\/$/,'')+'/chat/completions',{method:'POST',headers:{'Content-Type':'application/json',...(s.key?{Authorization:'Bearer '+s.key}:{})},body:JSON.stringify(body)});
+      const j=await r.json();if(!r.ok)throw new Error(j.error?.message||'OpenAI error');
+      text=j.choices?.[0]?.message?.content||'';
+    }
+    const a=text.indexOf('{'),z=text.lastIndexOf('}');return JSON.parse(text.slice(a,z+1));
+  },
+  caseText(c){return `Title: ${c.title}\nDiscipline: ${c.disc}\nPatient: ${c.age||'?'}y ${c.gender||''}, ${c.occ||''}. Context: ${c.social||''}\n`+(c.raw?`Case notes:\n${c.raw}`:FIELDS.map(([k,l])=>`${l}: ${c[k]||'-'}`).join('\n'))},
+  async viva(s,c){
+    const j=await this.call(s,`Case:\n${this.caseText(c)}\n\nGenerate 12 viva examiner questions (3 per domain) with a concise model answer / examiner's expectation each. Domains: 1=${DOM[0]}; 2=${DOM[1]}; 3=${DOM[2]}; 4=${DOM[3]}.\nReturn JSON: {"questions":[{"domain":1,"q":"...","a":"..."}]}`);
+    return (j.questions||[]).map(x=>({id:uid(),domain:Math.min(4,Math.max(1,+x.domain||1)),q:x.q,a:x.a,status:null}));
+  },
+  async ebm(s,c){
+    return this.call(s,`Case:\n${this.caseText(c)}\n\nCompare the logged management against current evidence. Return JSON: {"acute_longterm":{"nonpharm":["..."],"pharm":["..."]},"monitoring":["monitoring, safety netting, referral criteria primary->secondary/tertiary"],"gaps":["constructive critique of the logged plan"],"sources":[{"title":"guideline/paper, year","tier":"Malaysian CPG/KKM | International guideline | Journal","note":"why relevant / confidence"}]}. List Malaysian sources first.`);
+  }
+};
+
+/* ---------- helpers ---------- */
+const toMD=c=>{
+  let m=`# ${c.title}\n*${c.disc} · ${c.age||'?'}y ${c.gender||''} · ${c.occ||''}*\n\n`;
+  if(c.social)m+=`**Context:** ${c.social}\n\n`;
+  if(c.raw)m+=`## Case notes\n${c.raw}\n\n`;else FIELDS.forEach(([k,l])=>{if(c[k])m+=`## ${l}\n${c[k]}\n\n`});
+  if(c.viva?.length){m+=`## Viva Q&A\n`;DOM.forEach((d,i)=>{const qs=c.viva.filter(q=>q.domain===i+1);if(qs.length){m+=`\n### ${d}\n`;qs.forEach((q,n)=>m+=`\n**Q${n+1}${q.status?' ['+STAT[q.status][0]+']':''}:** ${q.q}\n> ${q.a}\n`)}})}
+  if(c.ebm){const e=c.ebm,L=a=>(a||[]).map(x=>'- '+x).join('\n');m+=`\n## EBM Management Check\n### Non-pharmacological\n${L(e.acute_longterm?.nonpharm)}\n### Pharmacological\n${L(e.acute_longterm?.pharm)}\n### Monitoring, safety netting & referral\n${L(e.monitoring)}\n### Gaps in my plan\n${L(e.gaps)}\n### Sources\n${L((e.sources||[]).map(s=>`${s.title} (${s.tier}) – ${s.note||''}`))}\n`}
+  return m;
+};
+const copy=t=>{try{navigator.clipboard.writeText(t);return true}catch(e){return false}};
+const inp='w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-teal-600';
+const btn='px-3 py-1.5 rounded-lg text-sm font-medium';
+const pri=btn+' bg-teal-700 text-white hover:bg-teal-800 disabled:opacity-50';
+const gho=btn+' border border-slate-300 dark:border-slate-600 hover:bg-slate-100 dark:hover:bg-slate-800';
+const card='rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4';
+
+/* ---------- components ---------- */
+function Form({init,onSave,onCancel}){
+  const [c,setC]=useState(init||{title:'',disc:DISC[0],age:'',gender:'',occ:'',social:'',tags:'',mode:'form'});
+  const set=(k,v)=>setC(p=>({...p,[k]:v}));
+  const raw=c.mode==='raw';
+  return html`<form className="space-y-3 max-w-3xl" onSubmit=${e=>{e.preventDefault();onSave({...c,id:c.id||uid(),updated:Date.now()})}}>
+    <h2 className="text-xl font-semibold">${c.id?'Edit case':'New diary case'}</h2>
+    <div className="rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-300 dark:border-amber-700 text-amber-900 dark:text-amber-200 text-sm p-3"><b>PDPA reminder:</b> do not enter names, IC numbers, MRN, phone numbers, addresses or any identifiable details. Use age, gender and generalised context only.</div>
+    <input required autoFocus className=${inp} placeholder="Case title" value=${c.title} onChange=${e=>set('title',e.target.value)}/>
+    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+      <select className=${inp+' col-span-2'} value=${c.disc} onChange=${e=>set('disc',e.target.value)}>${DISC.map(d=>html`<option key=${d}>${d}</option>`)}</select>
+      <input className=${inp} placeholder="Age" value=${c.age} onChange=${e=>set('age',e.target.value)}/>
+      <select className=${inp} value=${c.gender} onChange=${e=>set('gender',e.target.value)}><option value="">Gender</option><option>Male</option><option>Female</option></select>
+      <input className=${inp+' col-span-2'} placeholder="Occupation" value=${c.occ} onChange=${e=>set('occ',e.target.value)}/>
+      <input className=${inp+' col-span-2'} placeholder="Tags (comma separated)" value=${c.tags} onChange=${e=>set('tags',e.target.value)}/>
+    </div>
+    <textarea rows="2" className=${inp} placeholder="Relevant social / family context" value=${c.social} onChange=${e=>set('social',e.target.value)}/>
+    <div className="flex gap-2"><button type="button" className=${raw?gho:pri} onClick=${()=>set('mode','form')}>Structured form</button><button type="button" className=${raw?pri:gho} onClick=${()=>set('mode','raw')}>Quick free-text paste</button></div>
+    ${raw?html`<textarea rows="12" className=${inp} placeholder="Paste the whole case here…" value=${c.raw||''} onChange=${e=>set('raw',e.target.value)}/>`
+      :FIELDS.map(([k,l])=>html`<label key=${k} className="block text-sm font-medium">${l}<textarea rows="3" className=${inp+' mt-1 font-normal'} value=${c[k]||''} onChange=${e=>set(k,e.target.value)}/></label>`)}
+    <div className="flex gap-2"><button className=${pri}>Save case</button><button type="button" className=${gho} onClick=${onCancel}>Cancel</button></div>
+  </form>`;
+}
+
+function Viva({c,upd,settings}){
+  const [busy,setBusy]=useState(false),[err,setErr]=useState(''),[mock,setMock]=useState(false),[open,setOpen]=useState({});
+  const gen=async()=>{setBusy(true);setErr('');try{upd({viva:await AI.viva(settings,c)})}catch(e){setErr(e.message+(e.message==='Failed to fetch'?' (network blocked – see note in Settings)':''))}setBusy(false)};
+  const setS=(id,s)=>upd({viva:c.viva.map(q=>q.id===id?{...q,status:q.status===s?null:s}:q)});
+  return html`<div className="space-y-4">
+    <div className="flex flex-wrap gap-2 items-center noprint"><button className=${pri} disabled=${busy} onClick=${gen}>${busy?'Generating…':c.viva?.length?'Regenerate Viva Questions':'Generate Viva Questions'}</button>
+      ${c.viva?.length?html`<label className="text-sm flex items-center gap-2"><input type="checkbox" checked=${mock} onChange=${e=>setMock(e.target.checked)}/> Mock Viva Mode (hide answers)</label>`:null}</div>
+    ${err?html`<p className="text-rose-600 text-sm">${err}</p>`:null}
+    ${DOM.map((d,i)=>{const qs=(c.viva||[]).filter(q=>q.domain===i+1);return qs.length?html`<section key=${d}><h3 className="font-semibold text-teal-700 dark:text-teal-400 mb-2">${i+1}. ${d}</h3><div className="space-y-2">
+      ${qs.map(q=>html`<div key=${q.id} className=${card}>
+        <p className="font-medium">${q.q}</p>
+        <div className="mt-2 flex flex-wrap gap-2 items-center noprint">
+          <button className=${gho} onClick=${()=>setOpen(o=>({...o,[q.id]:!o[q.id]}))}>${open[q.id]||!mock&&false?'Hide':'Show'} model answer</button>
+          ${Object.entries(STAT).map(([k,[l,cls]])=>html`<button key=${k} className=${btn+' '+(q.status===k?cls:'border border-slate-300 dark:border-slate-600')} onClick=${()=>setS(q.id,k)}>${l}</button>`)}
+        </div>
+        ${open[q.id]?html`<div className="mt-2 text-sm pre bg-slate-50 dark:bg-slate-900 rounded-lg p-3">${q.a}</div>`:null}
+      </div>`)}</div></section>`:null})}
+  </div>`;
+}
+
+function EBM({c,upd,settings}){
+  const [busy,setBusy]=useState(false),[err,setErr]=useState('');
+  const run=async()=>{setBusy(true);setErr('');try{upd({ebm:await AI.ebm(settings,c)})}catch(e){setErr(e.message)}setBusy(false)};
+  const e=c.ebm,L=(t,a,cls='')=>a?.length?html`<div className=${card+' '+cls}><h4 className="font-semibold mb-1">${t}</h4><ul className="list-disc pl-5 text-sm space-y-1">${a.map((x,i)=>html`<li key=${i}>${x}</li>`)}</ul></div>`:null;
+  return html`<div className="space-y-3"><button className=${pri+' noprint'} disabled=${busy} onClick=${run}>${busy?'Checking…':e?'Re-run EBM Management Check':'EBM Management Check'}</button>
+    ${err?html`<p className="text-rose-600 text-sm">${err}</p>`:null}
+    ${e?html`<div className="space-y-3">
+      <h3 className="font-semibold text-teal-700 dark:text-teal-400">Immediate / Acute & Long-Term Management</h3>
+      ${L('Non-pharmacological',e.acute_longterm?.nonpharm)}${L('Pharmacological',e.acute_longterm?.pharm)}
+      <h3 className="font-semibold text-teal-700 dark:text-teal-400">Monitoring, Safety Netting & Referral Criteria</h3>${L('Primary → secondary/tertiary',e.monitoring)}
+      <h3 className="font-semibold text-teal-700 dark:text-teal-400">Gaps or Pitfalls in My Logged Plan</h3>${L('Constructive critique',e.gaps,'border-amber-400')}
+      <h3 className="font-semibold text-teal-700 dark:text-teal-400">Source Hierarchy & Citations</h3>
+      <div className=${card}><ol className="list-decimal pl-5 text-sm space-y-1">${(e.sources||[]).map((s,i)=>html`<li key=${i}><b>${s.title}</b> <span className="text-xs px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-700">${s.tier}</span> ${s.note}</li>`)}</ol><p className="text-xs text-slate-500 mt-2">AI-generated: verify every citation against the original guideline before relying on it.</p></div></div>`:null}</div>`;
+}
+
+function CaseView({c,upd,del,edit,settings}){
+  const [tab,setTab]=useState('case');
+  const tabs=[['case','Case'],['viva','Viva'],['ebm','EBM']];
+  return html`<div className="max-w-3xl space-y-4">
+    <div><h2 className="text-xl font-semibold">${c.title}</h2><p className="text-sm text-slate-500">${c.disc} · ${c.age||'?'}y ${c.gender} ${c.occ?'· '+c.occ:''} ${c.tags?'· #'+c.tags.split(',').map(t=>t.trim()).filter(Boolean).join(' #'):''}</p></div>
+    <div className="flex flex-wrap gap-2 noprint"><button className=${gho} onClick=${edit}>Edit</button><button className=${gho} onClick=${()=>alert(copy(toMD(c))?'Markdown copied to clipboard':'Copy failed')}>Copy Markdown</button><button className=${gho} onClick=${()=>window.print()}>Print / Save PDF</button><button className=${gho+' text-rose-600'} onClick=${()=>confirm('Delete this case?')&&del()}>Delete</button></div>
+    <div className="flex gap-1 border-b border-slate-200 dark:border-slate-700 noprint">${tabs.map(([k,l])=>html`<button key=${k} onClick=${()=>setTab(k)} className=${'px-4 py-2 text-sm font-medium '+(tab===k?'border-b-2 border-teal-600 text-teal-700 dark:text-teal-400':'text-slate-500')}>${l}</button>`)}</div>
+    ${tab==='case'?html`<div className="space-y-3">${c.social?html`<div className=${card}><b className="text-sm">Social / family context</b><p className="pre text-sm">${c.social}</p></div>`:null}
+      ${c.raw?html`<div className=${card}><p className="pre text-sm">${c.raw}</p></div>`:FIELDS.map(([k,l])=>c[k]?html`<div key=${k} className=${card}><b className="text-sm">${l}</b><p className="pre text-sm mt-1">${c[k]}</p></div>`:null)}</div>`:null}
+    ${tab==='viva'?html`<${Viva} c=${c} upd=${upd} settings=${settings}/>`:null}
+    ${tab==='ebm'?html`<${EBM} c=${c} upd=${upd} settings=${settings}/>`:null}
+  </div>`;
+}
+
+function Dashboard({cases,go}){
+  const by=useMemo(()=>DISC.map(d=>[d,cases.filter(c=>c.disc===d).length]),[cases]);
+  const max=Math.max(1,...by.map(b=>b[1]));
+  const weak=cases.flatMap(c=>(c.viva||[]).filter(q=>q.status==='weak'||q.status==='review').map(q=>({...q,cid:c.id,ct:c.title})));
+  const nq=cases.reduce((n,c)=>n+(c.viva?.length||0),0);
+  return html`<div className="space-y-4 max-w-3xl"><h2 className="text-xl font-semibold">Dashboard</h2>
+    <div className="grid grid-cols-3 gap-2">${[['Cases',cases.length],['Viva Qs',nq],['Weak / review',weak.length]].map(([l,v])=>html`<div key=${l} className=${card+' text-center'}><div className="text-2xl font-bold text-teal-700 dark:text-teal-400">${v}</div><div className="text-xs text-slate-500">${l}</div></div>`)}</div>
+    <div className=${card}><h3 className="font-semibold mb-2">Coverage by discipline <span className="text-xs font-normal text-slate-500">(red = no cases yet)</span></h3>
+      ${by.map(([d,n])=>html`<div key=${d} className="flex items-center gap-2 text-sm mb-1"><span className=${'w-44 shrink-0 '+(n?'':'text-rose-600')}>${d}</span><div className="flex-1 h-3 rounded bg-slate-100 dark:bg-slate-700"><div className="h-3 rounded bg-teal-600" style=${{width:n/max*100+'%'}}/></div><span className="w-5 text-right">${n}</span></div>`)}</div>
+    <div className=${card}><h3 className="font-semibold mb-2">Questions to revise</h3>${weak.length?weak.map(q=>html`<div key=${q.id} className="text-sm py-2 border-b last:border-0 border-slate-100 dark:border-slate-700 cursor-pointer" onClick=${()=>go({v:'case',id:q.cid})}><span className=${'text-xs px-1.5 py-0.5 rounded mr-2 '+STAT[q.status][1]}>${STAT[q.status][0]}</span>${q.q}<div className="text-xs text-slate-500">${q.ct}</div></div>`):html`<p className="text-sm text-slate-500">Mark questions as Weak or Needs Review in Mock Viva and they will appear here.</p>`}</div></div>`;
+}
+
+function Settings({data,setData}){
+  const s=data.settings,[imp,setImp]=useState(''),[gu,setGu]=useState(0),P=PROVIDERS[s.provider]||PROVIDERS.gemini;
+  const set=(k,v)=>setData(d=>({...d,settings:{...d.settings,[k]:v}}));
+  return html`<div className="space-y-3 max-w-2xl"><h2 className="text-xl font-semibold">Settings</h2>
+    <div className=${card+' space-y-2'}>
+      <select className=${inp} value=${s.provider} onChange=${e=>setData(d=>({...d,settings:{...d.settings,provider:e.target.value,model:'',base:''}}))}>${Object.entries(PROVIDERS).map(([k,p])=>html`<option key=${k} value=${k}>${p.name}</option>`)}</select>
+      ${P.oauth?html`<div className="space-y-2"><input className=${inp} placeholder="Google OAuth Client ID (xxxx.apps.googleusercontent.com)" value=${s.cid||''} onChange=${e=>set('cid',e.target.value)}/><div className="flex gap-2 items-center"><button type="button" className=${pri} onClick=${()=>Google.token(s).then(()=>setGu(1),e=>alert(e.message))}>Sign in with Google</button><button type="button" className=${gho} onClick=${()=>{Google.out();setGu(0)}}>Sign out</button><span className="text-sm">${Google.tok?'✓ Signed in':'Not signed in'}</span></div><ol className="list-decimal pl-5 text-xs text-slate-500 space-y-0.5"><li>Google Cloud Console: create/select a project and enable the Generative Language API.</li><li>APIs & Services → OAuth consent screen: add yourself as a Test user.</li><li>Credentials → Create OAuth client ID → Web application. Add the exact origin you open this app from under Authorized JavaScript origins (e.g. http://localhost:8000).</li><li>Paste the Client ID above, then Sign in. Usage counts against that project's Gemini quota.</li></ol></div>`:null}
+      ${P.custom||P.local?html`<input className=${inp} placeholder=${'Base URL'+(P.url?' (default '+P.url+')':' e.g. https://host/v1')} value=${s.base||''} onChange=${e=>set('base',e.target.value)}/>`:null}
+      ${P.type==='manual'?html`<p className="text-sm text-slate-600 dark:text-slate-300">No key needed: clicking a generate button copies the full prompt. Paste it into any AI chat, then paste its JSON reply into the box that appears.</p>`:html`<input className=${inp} placeholder=${'Model'+(P.model?' (default '+P.model+')':' name')} value=${s.model} onChange=${e=>set('model',e.target.value)}/>`}
+      ${P.type==='manual'||P.oauth?null:html`<input className=${inp} type="password" placeholder=${P.local?'API key (optional for local servers)':'API key (stored only in this browser)'} value=${s.key} onChange=${e=>set('key',e.target.value)}/>`}
+      <label className="text-sm font-medium">Clinical system prompt<textarea rows="8" className=${inp+' mt-1 font-normal'} value=${s.prompt} onChange=${e=>set('prompt',e.target.value)}/></label>
+      <button className=${gho} onClick=${()=>set('prompt',DEFAULT_PROMPT)}>Reset prompt</button>
+      <p className="text-xs text-slate-500">Note: AI calls go straight from your browser to the provider. The hosted preview page blocks outside requests, so only Manual mode works there; for the others save this file and open it locally (or host it yourself). Local servers need CORS enabled (Ollama: set OLLAMA_ORIGINS=*). Keys are shared across providers in one field, so re-enter when switching.</p></div>
+    <div className=${card+' space-y-2'}><h3 className="font-semibold">Backup</h3>
+      <button className=${gho} onClick=${()=>alert(copy(JSON.stringify({cases:data.cases}))?'Backup JSON copied to clipboard':'Copy failed')}>Copy backup JSON</button>
+      <textarea rows="3" className=${inp} placeholder="Paste backup JSON to import (merges by case id)" value=${imp} onChange=${e=>setImp(e.target.value)}/>
+      <div className="flex gap-2 items-center"><button className=${gho} onClick=${()=>{try{const j=JSON.parse(imp);setData(d=>{const m=new Map(d.cases.map(c=>[c.id,c]));j.cases.forEach(c=>m.set(c.id,c));return{...d,cases:[...m.values()]}});setImp('');alert('Imported')}catch(e){alert('Invalid JSON')}}}>Import pasted JSON</button>
+      <input type="file" accept=".json" className="text-xs" onChange=${e=>{const f=e.target.files[0];if(f)f.text().then(setImp)}}/></div></div></div>`;
+}
+
+function App(){
+  const [data,setData]=useState(load);
+  const [r,setR]=useState({v:'dash'}),[q,setQ]=useState(''),[fd,setFd]=useState(''),[nav,setNav]=useState(false);
+  const sr=useRef();
+  useEffect(()=>{try{localStorage.setItem(KEY,JSON.stringify(data))}catch(e){}},[data]);
+  useEffect(()=>{document.documentElement.classList.toggle('dark',!!data.settings.dark)},[data.settings.dark]);
+  useEffect(()=>{const h=e=>{if(/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)){if(e.key==='Escape')e.target.blur();return}
+    if(e.key==='n')setR({v:'form'});else if(e.key==='/'){e.preventDefault();setR({v:'list'});setTimeout(()=>sr.current?.focus(),50)}else if(e.key==='d')setR({v:'dash'});else if(e.key==='c')setR({v:'list'});else if(e.key==='s')setR({v:'set'})};
+    window.addEventListener('keydown',h);return()=>window.removeEventListener('keydown',h)},[]);
+  const cases=data.cases,cur=cases.find(c=>c.id===r.id);
+  const upd=p=>setData(d=>({...d,cases:d.cases.map(c=>c.id===r.id?{...c,...p,updated:Date.now()}:c)}));
+  const filtered=cases.filter(c=>(!fd||c.disc===fd)&&(!q||(c.title+c.tags+c.dx+c.raw+c.complaint).toLowerCase().includes(q.toLowerCase()))).sort((a,b)=>b.updated-a.updated);
+  const items=[['dash','Dashboard','d'],['list','Cases','c'],['set','Settings','s']];
+  return html`<div className="min-h-screen">
+    <header className="noprint sticky top-0 z-10 bg-white/90 dark:bg-slate-900/90 backdrop-blur border-b border-slate-200 dark:border-slate-700">
+      <div className="max-w-5xl mx-auto px-4 py-2 flex items-center gap-2">
+        <h1 className="font-bold text-teal-700 dark:text-teal-400 mr-2">FM Diary Viva</h1>
+        <nav className="flex gap-1 flex-1 overflow-x-auto">${items.map(([k,l,h])=>html`<button key=${k} title=${'Shortcut: '+h} onClick=${()=>setR({v:k})} className=${'px-3 py-1.5 rounded-lg text-sm '+(r.v===k?'bg-teal-700 text-white':'hover:bg-slate-100 dark:hover:bg-slate-800')}>${l}</button>`)}</nav>
+        <button className=${gho} title="Toggle theme" onClick=${()=>setData(d=>({...d,settings:{...d.settings,dark:!d.settings.dark}}))}>${data.settings.dark?'☀':'☾'}</button>
+        <button className=${pri} title="Shortcut: n" onClick=${()=>setR({v:'form'})}>+ Case</button>
+      </div></header>
+    <main className="max-w-5xl mx-auto px-4 py-5">
+      ${r.v==='dash'?html`<${Dashboard} cases=${cases} go=${setR}/>`:null}
+      ${r.v==='list'?html`<div className="space-y-3 max-w-3xl"><div className="flex gap-2"><input ref=${sr} className=${inp} placeholder="Search cases ( / )" value=${q} onChange=${e=>setQ(e.target.value)}/><select className=${inp+' max-w-[11rem]'} value=${fd} onChange=${e=>setFd(e.target.value)}><option value="">All disciplines</option>${DISC.map(d=>html`<option key=${d}>${d}</option>`)}</select></div>
+        ${filtered.length?filtered.map(c=>html`<div key=${c.id} tabIndex="0" className=${card+' cursor-pointer hover:border-teal-500'} onKeyDown=${e=>e.key==='Enter'&&setR({v:'case',id:c.id})} onClick=${()=>setR({v:'case',id:c.id})}><div className="font-medium">${c.title}</div><div className="text-xs text-slate-500">${c.disc} · ${c.age||'?'}y ${c.gender} · ${c.viva?.length||0} Qs ${c.ebm?'· EBM ✓':''} ${c.tags?'· #'+c.tags:''}</div></div>`):html`<p className="text-slate-500 text-sm">No cases yet. Press <b>n</b> or tap + Case.</p>`}</div>`:null}
+      ${r.v==='form'?html`<${Form} onSave=${c=>{setData(d=>({...d,cases:[c,...d.cases]}));setR({v:'case',id:c.id})}} onCancel=${()=>setR({v:'list'})}/>`:null}
+      ${r.v==='edit'&&cur?html`<${Form} init=${cur} onSave=${c=>{setData(d=>({...d,cases:d.cases.map(x=>x.id===c.id?c:x)}));setR({v:'case',id:c.id})}} onCancel=${()=>setR({v:'case',id:cur.id})}/>`:null}
+      ${r.v==='case'&&cur?html`<${CaseView} key=${cur.id} c=${cur} upd=${upd} settings=${data.settings} edit=${()=>setR({v:'edit',id:cur.id})} del=${()=>{setData(d=>({...d,cases:d.cases.filter(x=>x.id!==cur.id)}));setR({v:'list'})}}/>`:null}
+      ${r.v==='set'?html`<${Settings} data=${data} setData=${setData}/>`:null}
+    </main></div>`;
+}
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App}/>`);
+</script>
+</body>
+</html>
